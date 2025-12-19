@@ -3,17 +3,18 @@
 A dice rolling application for the Waveshare ESP32-S3-Touch-LCD-1.28 development board. Shake the device to roll the dice!
 
 ## Features
-- 🎲 Visual dice display with dot patterns (1-6)
-- 📱 Shake detection using built-in accelerometer
-- ✨ Rolling animation
-- 🎯 Automatic shake detection with cooldown period
+- 🎲 Large numeric dice display (1-6) centered on screen
+- 📱 Shake detection using integrated QMI8658 accelerometer
+- ✨ Rolling animation with visual feedback
+- 🎯 Smart shake detection with cooldown period
+- 🔧 Serial command fallback if accelerometer unavailable
 
 ## Hardware
-- **MCU**: ESP32-S3
+- **MCU**: ESP32-S3 (240MHz, 320KB RAM, 8MB Flash)
 - **Display**: 1.28" Round LCD (240x240 pixels)
-- **Display Driver**: ST7789V
-- **Touch Controller**: CST816S
-- **Accelerometer**: MPU6050 (if available on your board)
+- **Display Driver**: GC9A01
+- **Accelerometer**: QMI8658 6-axis IMU (integrated)
+- **Interface**: SPI (display), I2C (accelerometer)
 
 ## Project Structure
 ```
@@ -44,10 +45,9 @@ Dice/
 - If accelerometer is not detected, you can type "roll" or "r" in the serial monitor
 
 ## Libraries Used
-- **TFT_eSPI**: Display library optimized for ESP32
-- **Adafruit GFX**: Graphics library
-- **Adafruit ST7789**: ST7789 display driver
-- **MPU6050**: Accelerometer library for shake detection
+- **TFT_eSPI** (v2.5.43): Display library optimized for ESP32 with GC9A01 support
+- **NimBLE-Arduino** (v1.4.2): Bluetooth Low Energy library (included, not actively used)
+- **Custom QMI8658 Driver**: Integrated I2C driver for onboard accelerometer
 
 ## Configuration
 
@@ -62,16 +62,33 @@ Modify `ROLL_DURATION` to change how long the rolling animation lasts (in millis
 ## Troubleshooting
 
 ### Accelerometer Not Detected
-If the MPU6050 is not found:
-- Check I2C connections (SDA/SCL pins)
-- Verify the accelerometer is present on your board variant
-- The app will still work - you can roll dice via serial commands
+If the QMI8658 is not found:
+- Check I2C pin connections (GPIO6 = SDA, GPIO7 = SCL)
+- Verify I2C address (should be 0x6B)
+- Check serial monitor for WHO_AM_I register value
+- The app will still work - you can roll dice via serial commands ("roll" or "r")
 
 ### Display Issues
 The TFT_eSPI library may need pin configuration. Check your board's pinout and adjust if needed.
 
 ## Display Specifications
 - Resolution: 240x240 pixels
-- Interface: SPI
-- Touch: Capacitive touch (CST816S)
+- Interface: SPI (80MHz)
+- Driver: GC9A01
+- Backlight: GPIO2 (active HIGH)
+
+## Documentation
+For complete documentation, see [DOCUMENTATION.md](DOCUMENTATION.md)
+
+## Quick Start
+```bash
+# Build project
+pio run
+
+# Upload to device
+pio run -t upload
+
+# Monitor serial output
+pio device monitor
+```
 

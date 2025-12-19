@@ -2,14 +2,113 @@
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <Wire.h>
-#include <MPU6050.h>
 
 // Initialize TFT display
 TFT_eSPI tft = TFT_eSPI();
 
-// Initialize MPU6050 accelerometer
-MPU6050 mpu;
+// QMI8658 I2C address
+#define QMI8658_ADDR 0x6B
+#define QMI8658_WHO_AM_I 0x00
+#define QMI8658_CTRL1 0x02
+#define QMI8658_CTRL2 0x03
+#define QMI8658_CTRL3 0x04
+#define QMI8658_CTRL7 0x08
+#define QMI8658_ACCEL_XOUT_L 0x35
+
+// I2C pins for QMI8658 on Waveshare board
+#define QMI8658_SDA 6
+#define QMI8658_SCL 7
+
 bool accelerometerAvailable = false;
+
+// QMI8658 sensor class
+class QMI8658 {
+private:
+  uint8_t address;
+  TwoWire* wire;
+  
+public:
+  QMI8658(uint8_t addr = QMI8658_ADDR) : address(addr), wire(&Wire) {}
+  
+  bool begin() {
+    // Initialize I2C with custom pins
+    wire->begin(QMI8658_SDA, QMI8658_SCL);
+    delay(10);
+    
+    // Check WHO_AM_I register
+    uint8_t whoami = readRegister(QMI8658_WHO_AM_I);
+    if (whoami != 0x05) {  // QMI8658 WHO_AM_I value
+      Serial.print("QMI8658 WHO_AM_I mismatch: 0x");
+      Serial.println(whoami, HEX);
+      return false;
+    }
+    
+    // Configure accelerometer
+    // CTRL1: Set ODR (Output Data Rate) to 100Hz
+    writeRegister(QMI8658_CTRL1, 0x60);  // 100Hz, enable accel
+    
+    // CTRL2: Set accelerometer range to ±2g
+    writeRegister(QMI8658_CTRL2, 0x00);  // ±2g range
+    
+    // CTRL3: Enable accelerometer
+    writeRegister(QMI8658_CTRL3, 0x00);
+    
+    // CTRL7: Enable accelerometer
+    writeRegister(QMI8658_CTRL7, 0x20);  // Enable accel
+    
+    delay(50);
+    return true;
+  }
+  
+  void getAcceleration(float* x, float* y, float* z) {
+    uint8_t data[6];
+    readRegisters(QMI8658_ACCEL_XOUT_L, data, 6);
+    
+    // Convert to 16-bit signed values
+    int16_t ax = (int16_t)(data[1] << 8 | data[0]);
+    int16_t ay = (int16_t)(data[3] << 8 | data[2]);
+    int16_t az = (int16_t)(data[5] << 8 | data[4]);
+    
+    // Convert to g (for ±2g range, LSB = 16384)
+    *x = ax / 16384.0;
+    *y = ay / 16384.0;
+    *z = az / 16384.0;
+  }
+  
+private:
+  void writeRegister(uint8_t reg, uint8_t value) {
+    wire->beginTransmission(address);
+    wire->write(reg);
+    wire->write(value);
+    wire->endTransmission();
+  }
+  
+  uint8_t readRegister(uint8_t reg) {
+    wire->beginTransmission(address);
+    wire->write(reg);
+    wire->endTransmission(false);
+    wire->requestFrom(address, (uint8_t)1);
+    if (wire->available()) {
+      return wire->read();
+    }
+    return 0;
+  }
+  
+  void readRegisters(uint8_t reg, uint8_t* data, uint8_t len) {
+    wire->beginTransmission(address);
+    wire->write(reg);
+    wire->endTransmission(false);
+    wire->requestFrom(address, len);
+    for (uint8_t i = 0; i < len; i++) {
+      if (wire->available()) {
+        data[i] = wire->read();
+      }
+    }
+  }
+};
+
+// Initialize QMI8658 accelerometer
+QMI8658 qmi8658;
 
 // Dice state
 int currentDiceValue = 1;
@@ -32,6 +131,23 @@ const uint8_t dicePatterns[6][9] = {
   {1, 0, 1, 0, 1, 0, 1, 0, 1}, // 5
   {1, 0, 1, 1, 0, 1, 1, 0, 1}  // 6
 };
+
+void drawDiceValue(int value) {
+  // Clear the center area for text
+  tft.fillRect(0, 80, 240, 80, TFT_BLACK);
+  
+  // Draw large dice value text in the center
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(8);
+  tft.setTextDatum(MC_DATUM); // Middle center alignment
+  
+  char valueStr[2];
+  sprintf(valueStr, "%d", value);
+  tft.drawString(valueStr, 120, 120, 1);
+  
+  Serial.print("Dice value displayed: ");
+  Serial.println(value);
+}
 
 void drawDice(int value, int x, int y, int size) {
   // Draw dice square
@@ -65,7 +181,7 @@ void drawDice(int value, int x, int y, int size) {
 void drawRollingAnimation() {
   // Show random dice values rapidly during roll
   int animValue = random(1, 7);
-  drawDice(animValue, 70, 70, 100);
+  drawDiceValue(animValue);
 }
 
 void rollDice() {
@@ -84,14 +200,9 @@ void rollDice() {
 void checkShake() {
   if (!accelerometerAvailable) return;
   
-  // Read accelerometer
-  int16_t ax, ay, az;
-  mpu.getAcceleration(&ax, &ay, &az);
-  
-  // Convert to g-force (MPU6050 default is ±2g, so divide by 16384)
-  float accelX = ax / 16384.0;
-  float accelY = ay / 16384.0;
-  float accelZ = az / 16384.0;
+  // Read accelerometer from QMI8658
+  float accelX, accelY, accelZ;
+  qmi8658.getAcceleration(&accelX, &accelY, &accelZ);
   
   // Calculate total acceleration change
   float deltaX = abs(accelX - lastX);
@@ -105,7 +216,9 @@ void checkShake() {
       (currentTime - lastShakeTime) > SHAKE_COOLDOWN) {
     lastShakeTime = currentTime;
     rollDice();
-    Serial.println("Shake detected!");
+    Serial.print("Shake detected! (delta: ");
+    Serial.print(totalDelta);
+    Serial.println(")");
   }
   
   // Update last values
@@ -119,43 +232,53 @@ void setup() {
   delay(1000);
   Serial.println("ESP32-S3 Dice Roller");
   
-  // Initialize I2C for MPU6050
-  Wire.begin();
-  
-  // Initialize MPU6050
-  Serial.println("Initializing MPU6050...");
-  if (mpu.begin()) {
+  // Initialize QMI8658 integrated accelerometer
+  Serial.println("Initializing QMI8658 accelerometer...");
+  if (qmi8658.begin()) {
     accelerometerAvailable = true;
-    Serial.println("MPU6050 found!");
-    
-    // Calibrate MPU6050
-    mpu.calcGyroOffsets(true);
-    Serial.println("MPU6050 calibrated!");
+    Serial.println("QMI8658 found and initialized!");
+    delay(100); // Give sensor time to stabilize
   } else {
     accelerometerAvailable = false;
-    Serial.println("Warning: MPU6050 not found. Shake detection disabled.");
-    Serial.println("You can still roll dice by touching the screen or using serial commands.");
+    Serial.println("Warning: QMI8658 not found. Shake detection disabled.");
+    Serial.println("You can still roll dice by using serial commands (type 'roll' or 'r').");
   }
   
   // Initialize display
+  Serial.println("Initializing display...");
   tft.init();
   tft.setRotation(0);
+  
+  // Enable backlight (if pin is defined)
+  #ifdef TFT_BL
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);
+    Serial.println("Backlight enabled");
+  #endif
+  
+  // Clear screen with a test pattern first
+  tft.fillScreen(TFT_BLUE);
+  delay(100);
   tft.fillScreen(TFT_BLACK);
   
-  // Draw initial dice
-  drawDice(currentDiceValue, 70, 70, 100);
+  // Set text wrapping
+  tft.setTextWrap(false, false);
   
-  // Draw instructions
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextSize(1);
-  tft.setCursor(50, 10);
+  // Draw instructions at top
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextDatum(TC_DATUM); // Top center alignment
   if (accelerometerAvailable) {
-    tft.println("Shake to Roll!");
+    tft.drawString("Shake to Roll!", 120, 10, 1);
   } else {
-    tft.println("Touch to Roll!");
+    tft.drawString("Type 'roll'", 120, 10, 1);
   }
   
+  // Draw initial dice value in center
+  drawDiceValue(currentDiceValue);
+  
   Serial.println("Setup complete!");
+  Serial.println("Display initialized - dice value should be visible");
 }
 
 void loop() {
@@ -180,18 +303,18 @@ void loop() {
     // Check if roll animation is complete
     if (millis() - rollStartTime >= ROLL_DURATION) {
       isRolling = false;
-      // Draw final dice value
-      drawDice(currentDiceValue, 70, 70, 100);
+      // Draw final dice value in center
+      drawDiceValue(currentDiceValue);
       
       // Update instruction text
-      tft.fillRect(0, 0, 240, 20, TFT_BLACK);
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.setTextSize(1);
-      tft.setCursor(50, 10);
+      tft.fillRect(0, 0, 240, 30, TFT_BLACK);
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setTextSize(2);
+      tft.setTextDatum(TC_DATUM);
       if (accelerometerAvailable) {
-        tft.println("Shake to Roll!");
+        tft.drawString("Shake to Roll!", 120, 10, 1);
       } else {
-        tft.println("Touch to Roll!");
+        tft.drawString("Type 'roll'", 120, 10, 1);
       }
     }
   }
