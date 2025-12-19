@@ -2,125 +2,66 @@
 #include <TFT_eSPI.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <math.h>
+#include "QMI8658.h"
+#include "DEV_Config.h"
 
 // Initialize TFT display
 TFT_eSPI tft = TFT_eSPI();
 
-// QMI8658 I2C address
-#define QMI8658_ADDR 0x6B
-#define QMI8658_WHO_AM_I 0x00
-#define QMI8658_CTRL1 0x02
-#define QMI8658_CTRL2 0x03
-#define QMI8658_CTRL3 0x04
-#define QMI8658_CTRL7 0x08
-#define QMI8658_ACCEL_XOUT_L 0x35
-
-// I2C pins for QMI8658 on Waveshare board
-#define QMI8658_SDA 6
-#define QMI8658_SCL 7
+// CST816S Touch controller I2C address and pins (shares I2C bus)
+#define CST816S_ADDR 0x15
+#define CST816S_TOUCH_NUM 0x02
+#define CST816S_XPOS_H 0x03
+#define CST816S_XPOS_L 0x04
+#define CST816S_YPOS_H 0x05
+#define CST816S_YPOS_L 0x06
 
 bool accelerometerAvailable = false;
 
-// QMI8658 sensor class
-class QMI8658 {
-private:
-  uint8_t address;
-  TwoWire* wire;
-  
-public:
-  QMI8658(uint8_t addr = QMI8658_ADDR) : address(addr), wire(&Wire) {}
-  
-  bool begin() {
-    // Initialize I2C with custom pins
-    wire->begin(QMI8658_SDA, QMI8658_SCL);
-    delay(10);
-    
-    // Check WHO_AM_I register
-    uint8_t whoami = readRegister(QMI8658_WHO_AM_I);
-    if (whoami != 0x05) {  // QMI8658 WHO_AM_I value
-      Serial.print("QMI8658 WHO_AM_I mismatch: 0x");
-      Serial.println(whoami, HEX);
-      return false;
-    }
-    
-    // Configure accelerometer
-    // CTRL1: Set ODR (Output Data Rate) to 100Hz
-    writeRegister(QMI8658_CTRL1, 0x60);  // 100Hz, enable accel
-    
-    // CTRL2: Set accelerometer range to ±2g
-    writeRegister(QMI8658_CTRL2, 0x00);  // ±2g range
-    
-    // CTRL3: Enable accelerometer
-    writeRegister(QMI8658_CTRL3, 0x00);
-    
-    // CTRL7: Enable accelerometer
-    writeRegister(QMI8658_CTRL7, 0x20);  // Enable accel
-    
-    delay(50);
-    return true;
-  }
-  
-  void getAcceleration(float* x, float* y, float* z) {
-    uint8_t data[6];
-    readRegisters(QMI8658_ACCEL_XOUT_L, data, 6);
-    
-    // Convert to 16-bit signed values
-    int16_t ax = (int16_t)(data[1] << 8 | data[0]);
-    int16_t ay = (int16_t)(data[3] << 8 | data[2]);
-    int16_t az = (int16_t)(data[5] << 8 | data[4]);
-    
-    // Convert to g (for ±2g range, LSB = 16384)
-    *x = ax / 16384.0;
-    *y = ay / 16384.0;
-    *z = az / 16384.0;
-  }
-  
-private:
-  void writeRegister(uint8_t reg, uint8_t value) {
-    wire->beginTransmission(address);
-    wire->write(reg);
-    wire->write(value);
-    wire->endTransmission();
-  }
-  
-  uint8_t readRegister(uint8_t reg) {
-    wire->beginTransmission(address);
-    wire->write(reg);
-    wire->endTransmission(false);
-    wire->requestFrom(address, (uint8_t)1);
-    if (wire->available()) {
-      return wire->read();
-    }
-    return 0;
-  }
-  
-  void readRegisters(uint8_t reg, uint8_t* data, uint8_t len) {
-    wire->beginTransmission(address);
-    wire->write(reg);
-    wire->endTransmission(false);
-    wire->requestFrom(address, len);
-    for (uint8_t i = 0; i < len; i++) {
-      if (wire->available()) {
-        data[i] = wire->read();
-      }
-    }
-  }
-};
+// Accelerometer data buffer
+float accelData[3] = {0, 0, 0};
 
-// Initialize QMI8658 accelerometer
-QMI8658 qmi8658;
+// Conversion constant: 1g = 9.807 m/s²
+const float ONE_G_MS2 = 9.807f;
+
+// Dice types
+const int DICE_TYPES[] = {4, 6, 8, 10, 20, 100};
+const int NUM_DICE_TYPES = 6;
+int currentDiceTypeIndex = 1; // Start with D6 (index 1)
+int currentDiceFaces = 6; // Current number of faces
+
+// Application states
+enum AppState {
+  STATE_SELECT_DICE,  // Selecting dice type
+  STATE_ROLLING,      // Rolling animation
+  STATE_SHOW_RESULT   // Showing final result
+};
+AppState currentState = STATE_SELECT_DICE;
 
 // Dice state
 int currentDiceValue = 1;
 bool isRolling = false;
 unsigned long rollStartTime = 0;
 const unsigned long ROLL_DURATION = 1000; // Roll animation duration in ms
-const float SHAKE_THRESHOLD = 15.0; // Acceleration threshold for shake detection
+const float SHAKE_THRESHOLD = 2.0; // Acceleration threshold for shake detection (in g)
+
+// Touch detection
+unsigned long lastTouchTime = 0;
+const unsigned long TOUCH_COOLDOWN = 300; // Minimum time between touch events (ms)
+unsigned long touchStartTime = 0;
+bool touchActive = false;
+const unsigned long LONG_PRESS_DURATION = 500; // Long press duration in ms
 
 // Previous accelerometer values for shake detection
 float lastX = 0, lastY = 0, lastZ = 0;
 unsigned long lastShakeTime = 0;
 const unsigned long SHAKE_COOLDOWN = 500; // Minimum time between shakes (ms)
+
+// Debug and monitoring
+unsigned long lastDebugPrint = 0;
+const unsigned long DEBUG_INTERVAL = 500; // Print debug info every 500ms
+bool debugMode = true; // Enable detailed serial output
 
 // Dice face patterns (1-6 dots)
 const uint8_t dicePatterns[6][9] = {
@@ -133,20 +74,63 @@ const uint8_t dicePatterns[6][9] = {
 };
 
 void drawDiceValue(int value) {
-  // Clear the center area for text
-  tft.fillRect(0, 80, 240, 80, TFT_BLACK);
+  // Clear the center area for text (adjusted to avoid overlap with "Shake to Roll!")
+  tft.fillRect(0, 60, 240, 60, TFT_BLACK);
   
-  // Draw large dice value text in the center
+  // Draw large dice value text in the center (slightly higher)
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextSize(8);
   tft.setTextDatum(MC_DATUM); // Middle center alignment
   
-  char valueStr[2];
+  char valueStr[4]; // Support up to 3 digits (100)
   sprintf(valueStr, "%d", value);
-  tft.drawString(valueStr, 120, 120, 1);
+  tft.drawString(valueStr, 120, 90, 1); // Moved up to y=90
   
   Serial.print("Dice value displayed: ");
   Serial.println(value);
+}
+
+void drawDiceSelectionScreen() {
+  // Clear screen
+  tft.fillScreen(TFT_BLACK);
+  
+  // Draw title
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("Dice Type", 120, 20, 1);
+  
+  // Draw current dice type (large)
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setTextSize(6);
+  tft.setTextDatum(MC_DATUM);
+  char diceTypeStr[5];
+  sprintf(diceTypeStr, "D%d", currentDiceFaces);
+  tft.drawString(diceTypeStr, 120, 100, 1);
+  
+  // Draw instructions
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("Tap to cycle", 120, 150, 1);
+  tft.drawString("Long press to select", 120, 165, 1);
+  tft.drawString("Shake to valid", 120, 180, 1);
+  
+  // Draw all available dice types at bottom
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setTextSize(1);
+  String diceList = "4  6  8  10  20  100";
+  tft.drawString(diceList, 120, 210, 1);
+  
+  // Highlight current selection
+  int xPos = 20; // Starting X position
+  int spacing = 35; // Spacing between dice types
+  for (int i = 0; i < NUM_DICE_TYPES; i++) {
+    if (i == currentDiceTypeIndex) {
+      // Draw highlight box
+      tft.drawRect(xPos + i * spacing - 8, 200, 16, 20, TFT_YELLOW);
+    }
+  }
 }
 
 void drawDice(int value, int x, int y, int size) {
@@ -180,7 +164,7 @@ void drawDice(int value, int x, int y, int size) {
 
 void drawRollingAnimation() {
   // Show random dice values rapidly during roll
-  int animValue = random(1, 7);
+  int animValue = random(1, currentDiceFaces + 1);
   drawDiceValue(animValue);
 }
 
@@ -189,20 +173,33 @@ void rollDice() {
   
   isRolling = true;
   rollStartTime = millis();
+  currentState = STATE_ROLLING;
   
-  // Generate final random value
-  currentDiceValue = random(1, 7);
+  // Generate final random value based on current dice type
+  currentDiceValue = random(1, currentDiceFaces + 1);
   
-  Serial.print("Rolling dice... Final value: ");
+  Serial.print("Rolling D");
+  Serial.print(currentDiceFaces);
+  Serial.print("... Final value: ");
   Serial.println(currentDiceValue);
+  
+  // Clear screen and show rolling
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("Rolling...", 120, 20, 1);
 }
 
 void checkShake() {
   if (!accelerometerAvailable) return;
   
-  // Read accelerometer from QMI8658
-  float accelX, accelY, accelZ;
-  qmi8658.getAcceleration(&accelX, &accelY, &accelZ);
+  // Read accelerometer from QMI8658 library (returns values in m/s²)
+  QMI8658_read_acc_xyz(accelData);
+  // Convert from m/s² to g (divide by 9.807 m/s² per g)
+  float accelX = accelData[0] / ONE_G_MS2;
+  float accelY = accelData[1] / ONE_G_MS2;
+  float accelZ = accelData[2] / ONE_G_MS2;
   
   // Calculate total acceleration change
   float deltaX = abs(accelX - lastX);
@@ -210,15 +207,121 @@ void checkShake() {
   float deltaZ = abs(accelZ - lastZ);
   float totalDelta = deltaX + deltaY + deltaZ;
   
-  // Check if shake detected
+  // Calculate magnitude of current acceleration
+  float magnitude = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
+  
+  // Debug output
   unsigned long currentTime = millis();
+  if (debugMode && (currentTime - lastDebugPrint) >= DEBUG_INTERVAL) {
+    lastDebugPrint = currentTime;
+    
+    Serial.println("=== Accelerometer Status ===");
+    Serial.print("Acceleration (m/s²) - X: ");
+    Serial.print(accelData[0], 2);
+    Serial.print(", Y: ");
+    Serial.print(accelData[1], 2);
+    Serial.print(", Z: ");
+    Serial.println(accelData[2], 2);
+    
+    // Convert to mg for display
+    float accelX_mg = accelData[0] / ONE_G_MS2 * 1000.0f;
+    float accelY_mg = accelData[1] / ONE_G_MS2 * 1000.0f;
+    float accelZ_mg = accelData[2] / ONE_G_MS2 * 1000.0f;
+    Serial.print("Acceleration (mg) - X: ");
+    Serial.print(accelX_mg, 1);
+    Serial.print(", Y: ");
+    Serial.print(accelY_mg, 1);
+    Serial.print(", Z: ");
+    Serial.println(accelZ_mg, 1);
+    
+    Serial.print("Acceleration (g) - X: ");
+    Serial.print(accelX, 3);
+    Serial.print(", Y: ");
+    Serial.print(accelY, 3);
+    Serial.print(", Z: ");
+    Serial.print(accelZ, 3);
+    Serial.print(", Magnitude: ");
+    Serial.println(magnitude, 3);
+    
+    Serial.print("Delta - X: ");
+    Serial.print(deltaX, 3);
+    Serial.print(", Y: ");
+    Serial.print(deltaY, 3);
+    Serial.print(", Z: ");
+    Serial.print(deltaZ, 3);
+    Serial.print(", Total: ");
+    Serial.print(totalDelta, 3);
+    Serial.print(" (Threshold: ");
+    Serial.print(SHAKE_THRESHOLD);
+    Serial.println(")");
+    
+    unsigned long timeSinceLastShake = currentTime - lastShakeTime;
+    Serial.print("Time since last shake: ");
+    Serial.print(timeSinceLastShake);
+    Serial.print("ms (Cooldown: ");
+    Serial.print(SHAKE_COOLDOWN);
+    Serial.println("ms)");
+    
+    if (totalDelta > SHAKE_THRESHOLD) {
+      Serial.print(">>> SHAKE DETECTED! (delta: ");
+      Serial.print(totalDelta, 3);
+      Serial.print(" > threshold: ");
+      Serial.print(SHAKE_THRESHOLD);
+      if (timeSinceLastShake < SHAKE_COOLDOWN) {
+        Serial.print(") - BUT IN COOLDOWN (");
+        Serial.print(SHAKE_COOLDOWN - timeSinceLastShake);
+        Serial.println("ms remaining)");
+      } else {
+        Serial.println(") - READY TO TRIGGER!");
+      }
+    } else {
+      Serial.print("No shake (delta: ");
+      Serial.print(totalDelta, 3);
+      Serial.print(" < threshold: ");
+      Serial.print(SHAKE_THRESHOLD);
+      Serial.println(")");
+    }
+    Serial.println("============================");
+  }
+  
+  // Check if shake detected
   if (totalDelta > SHAKE_THRESHOLD && 
       (currentTime - lastShakeTime) > SHAKE_COOLDOWN) {
     lastShakeTime = currentTime;
-    rollDice();
-    Serial.print("Shake detected! (delta: ");
-    Serial.print(totalDelta);
-    Serial.println(")");
+    
+    if (currentState == STATE_SELECT_DICE) {
+      // Shake to confirm dice selection
+      currentState = STATE_SHOW_RESULT;
+      Serial.println(">>> SHAKE DETECTED - CONFIRMING DICE SELECTION! <<<");
+      Serial.print("Selected dice: D");
+      Serial.println(currentDiceFaces);
+      
+      // Clear screen and show result screen
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextColor(TFT_GREEN, TFT_BLACK);
+      tft.setTextSize(2);
+      tft.setTextDatum(TC_DATUM);
+      char confirmStr[20];
+      sprintf(confirmStr, "D%d Selected", currentDiceFaces);
+      tft.drawString(confirmStr, 120, 50, 1);
+      
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.drawString("Shake to Roll!", 120, 160, 1); // Centered below dice value
+      
+      // Draw initial value
+      drawDiceValue(1);
+      
+      delay(1000); // Show confirmation briefly
+    } else {
+      // Shake to roll dice
+      rollDice();
+      Serial.println(">>> SHAKE DETECTED - ROLLING DICE! <<<");
+      Serial.print("  Delta: ");
+      Serial.print(totalDelta, 3);
+      Serial.print("g, Magnitude: ");
+      Serial.print(magnitude, 3);
+      Serial.println("g");
+    }
   }
   
   // Update last values
@@ -232,17 +335,58 @@ void setup() {
   delay(1000);
   Serial.println("ESP32-S3 Dice Roller");
   
-  // Initialize QMI8658 integrated accelerometer
+  // Initialize I2C bus for QMI8658
+  Serial.println("\n========================================");
   Serial.println("Initializing QMI8658 accelerometer...");
-  if (qmi8658.begin()) {
+  Serial.println("========================================");
+  Serial.print("I2C Pins - SDA: GPIO");
+  Serial.print(QMI8658_SDA);
+  Serial.print(", SCL: GPIO");
+  Serial.println(QMI8658_SCL);
+  
+  // Initialize I2C
+  DEV_I2C_Init();
+  delay(10);
+  
+  // Initialize QMI8658 using library
+  if (QMI8658_init()) {
     accelerometerAvailable = true;
-    Serial.println("QMI8658 found and initialized!");
+    Serial.println("\n>>> QMI8658 SUCCESSFULLY INITIALIZED! <<<");
+    Serial.print("Shake threshold: ");
+    Serial.print(SHAKE_THRESHOLD);
+    Serial.println("g");
+    Serial.print("Cooldown period: ");
+    Serial.print(SHAKE_COOLDOWN);
+    Serial.println("ms");
     delay(100); // Give sensor time to stabilize
+    
+    // Read initial values (library returns m/s²)
+    QMI8658_read_acc_xyz(accelData);
+    float initX = accelData[0] / ONE_G_MS2; // Convert from m/s² to g
+    float initY = accelData[1] / ONE_G_MS2;
+    float initZ = accelData[2] / ONE_G_MS2;
+    Serial.println("\nInitial accelerometer reading:");
+    Serial.print("  X: ");
+    Serial.print(initX, 3);
+    Serial.print("g, Y: ");
+    Serial.print(initY, 3);
+    Serial.print("g, Z: ");
+    Serial.print(initZ, 3);
+    Serial.println("g");
+    lastX = initX;
+    lastY = initY;
+    lastZ = initZ;
   } else {
     accelerometerAvailable = false;
-    Serial.println("Warning: QMI8658 not found. Shake detection disabled.");
+    Serial.println("\n>>> WARNING: QMI8658 INITIALIZATION FAILED! <<<");
+    Serial.println("Shake detection disabled.");
     Serial.println("You can still roll dice by using serial commands (type 'roll' or 'r').");
+    Serial.println("\nTroubleshooting:");
+    Serial.println("  1. Check I2C pin connections (SDA=GPIO6, SCL=GPIO7)");
+    Serial.println("  2. Verify I2C address (should be 0x6A)");
+    Serial.println("  3. Check WHO_AM_I register value in output above");
   }
+  Serial.println("========================================\n");
   
   // Initialize display
   Serial.println("Initializing display...");
@@ -264,57 +408,221 @@ void setup() {
   // Set text wrapping
   tft.setTextWrap(false, false);
   
-  // Draw instructions at top
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setTextSize(2);
-  tft.setTextDatum(TC_DATUM); // Top center alignment
-  if (accelerometerAvailable) {
-    tft.drawString("Shake to Roll!", 120, 10, 1);
-  } else {
-    tft.drawString("Type 'roll'", 120, 10, 1);
-  }
+  // Start in dice selection state
+  currentState = STATE_SELECT_DICE;
+  currentDiceFaces = DICE_TYPES[currentDiceTypeIndex];
   
-  // Draw initial dice value in center
-  drawDiceValue(currentDiceValue);
+  // Draw dice selection screen
+  drawDiceSelectionScreen();
   
   Serial.println("Setup complete!");
-  Serial.println("Display initialized - dice value should be visible");
+  Serial.println("Dice selection screen displayed");
+  Serial.println("Available dice types: D4, D6, D8, D10, D20, D100");
+  Serial.println("Serial commands: 'next' or 'n' to cycle, 'confirm' or 'c' to select");
+}
+
+bool readTouch(uint16_t* x, uint16_t* y) {
+  // Read touch from CST816S via I2C
+  Wire.beginTransmission(CST816S_ADDR);
+  uint8_t error = Wire.endTransmission();
+  if (error != 0) {
+    return false; // Touch controller not responding
+  }
+  
+  // Read touch number register
+  Wire.beginTransmission(CST816S_ADDR);
+  Wire.write(CST816S_TOUCH_NUM);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)CST816S_ADDR, (uint8_t)1);
+  
+  if (!Wire.available()) return false;
+  uint8_t touchNum = Wire.read();
+  
+  if (touchNum == 0) return false; // No touch
+  
+  // Read X and Y coordinates
+  uint8_t data[4];
+  Wire.beginTransmission(CST816S_ADDR);
+  Wire.write(CST816S_XPOS_H);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)CST816S_ADDR, (uint8_t)4);
+  
+  if (Wire.available() < 4) return false;
+  
+  data[0] = Wire.read(); // X high
+  data[1] = Wire.read(); // X low
+  data[2] = Wire.read(); // Y high
+  data[3] = Wire.read(); // Y low
+  
+  // Convert to coordinates (240x240 display)
+  *x = ((data[0] & 0x0F) << 8) | data[1];
+  *y = ((data[2] & 0x0F) << 8) | data[3];
+  
+  return true;
+}
+
+void checkTouch() {
+  uint16_t x = 0, y = 0;
+  bool touched = readTouch(&x, &y);
+  unsigned long currentTime = millis();
+  
+  if (touched) {
+    // Touch is active
+    if (!touchActive) {
+      // Touch just started
+      touchActive = true;
+      touchStartTime = currentTime;
+      Serial.print("Touch started at X: ");
+      Serial.print(x);
+      Serial.print(", Y: ");
+      Serial.println(y);
+    } else {
+      // Touch is continuing - check for long press
+      unsigned long touchDuration = currentTime - touchStartTime;
+      
+      if (touchDuration >= LONG_PRESS_DURATION && (currentTime - lastTouchTime) > TOUCH_COOLDOWN) {
+        // Long press detected
+        lastTouchTime = currentTime;
+        touchActive = false; // Reset touch state
+        
+        Serial.print("Long press detected! (");
+        Serial.print(touchDuration);
+        Serial.println("ms)");
+        
+        // Long press: Go back to dice selection mode
+        if (currentState != STATE_SELECT_DICE) {
+          currentState = STATE_SELECT_DICE;
+          Serial.println("Returning to dice selection mode");
+          drawDiceSelectionScreen();
+        } else {
+          // Already in selection mode - confirm selection
+          currentState = STATE_SHOW_RESULT;
+          Serial.print("Confirming dice selection: D");
+          Serial.println(currentDiceFaces);
+          
+          tft.fillScreen(TFT_BLACK);
+          tft.setTextColor(TFT_GREEN, TFT_BLACK);
+          tft.setTextSize(2);
+          tft.setTextDatum(TC_DATUM);
+          char confirmStr[20];
+          sprintf(confirmStr, "D%d Selected", currentDiceFaces);
+          tft.drawString(confirmStr, 120, 50, 1);
+          tft.setTextColor(TFT_CYAN, TFT_BLACK);
+          tft.drawString("Shake to Roll!", 120, 120, 1);
+          drawDiceValue(1);
+        }
+      }
+    }
+  } else {
+    // No touch detected
+    if (touchActive) {
+      // Touch just ended - check if it was a short press
+      unsigned long touchDuration = currentTime - touchStartTime;
+      touchActive = false;
+      
+      if (touchDuration < LONG_PRESS_DURATION && (currentTime - lastTouchTime) > TOUCH_COOLDOWN) {
+        // Short press - cycle dice type (only in selection mode)
+        lastTouchTime = currentTime;
+        
+        Serial.print("Short press detected (");
+        Serial.print(touchDuration);
+        Serial.println("ms)");
+        
+        if (currentState == STATE_SELECT_DICE) {
+          // Cycle to next dice type
+          currentDiceTypeIndex = (currentDiceTypeIndex + 1) % NUM_DICE_TYPES;
+          currentDiceFaces = DICE_TYPES[currentDiceTypeIndex];
+          
+          Serial.print("Dice type changed to D");
+          Serial.println(currentDiceFaces);
+          
+          // Redraw selection screen
+          drawDiceSelectionScreen();
+        }
+      }
+    }
+  }
 }
 
 void loop() {
-  // Check for shake (if accelerometer available)
-  if (accelerometerAvailable) {
-    checkShake();
-  }
-  
-  // Alternative: Roll on serial command (for testing without accelerometer)
-  if (Serial.available()) {
-    String cmd = Serial.readString();
-    cmd.trim();
-    if (cmd == "roll" || cmd == "r") {
-      rollDice();
-    }
-  }
-  
-  if (isRolling) {
-    // Show rolling animation
-    drawRollingAnimation();
+  // Handle dice selection state
+  if (currentState == STATE_SELECT_DICE) {
+    // Check for touch to cycle dice types
+    checkTouch();
     
-    // Check if roll animation is complete
-    if (millis() - rollStartTime >= ROLL_DURATION) {
-      isRolling = false;
-      // Draw final dice value in center
-      drawDiceValue(currentDiceValue);
+    // Check for shake to confirm selection (handled in checkShake)
+    if (accelerometerAvailable) {
+      checkShake();
+    }
+    
+    // Alternative: Serial commands for testing
+    if (Serial.available()) {
+      String cmd = Serial.readString();
+      cmd.trim();
       
-      // Update instruction text
-      tft.fillRect(0, 0, 240, 30, TFT_BLACK);
-      tft.setTextColor(TFT_CYAN, TFT_BLACK);
-      tft.setTextSize(2);
-      tft.setTextDatum(TC_DATUM);
-      if (accelerometerAvailable) {
-        tft.drawString("Shake to Roll!", 120, 10, 1);
-      } else {
-        tft.drawString("Type 'roll'", 120, 10, 1);
+      if (cmd == "next" || cmd == "n") {
+        // Cycle to next dice type
+        currentDiceTypeIndex = (currentDiceTypeIndex + 1) % NUM_DICE_TYPES;
+        currentDiceFaces = DICE_TYPES[currentDiceTypeIndex];
+        Serial.print("Dice type changed to D");
+        Serial.println(currentDiceFaces);
+        drawDiceSelectionScreen();
+      } else if (cmd == "confirm" || cmd == "c") {
+        // Confirm selection
+        currentState = STATE_SHOW_RESULT;
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextColor(TFT_GREEN, TFT_BLACK);
+        tft.setTextSize(2);
+        tft.setTextDatum(TC_DATUM);
+        char confirmStr[20];
+        sprintf(confirmStr, "D%d Selected", currentDiceFaces);
+        tft.drawString(confirmStr, 120, 50, 1);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.drawString("Shake to Roll!", 120, 160, 1); // Centered below dice value
+        drawDiceValue(1);
+      }
+    }
+  } else {
+    // In rolling or result state
+    // Check for touch (long press to return to dice selection)
+    checkTouch();
+    
+    // Check for shake (if accelerometer available)
+    if (accelerometerAvailable) {
+      checkShake();
+    }
+    
+    // Alternative: Roll on serial command (for testing without accelerometer)
+    if (Serial.available()) {
+      String cmd = Serial.readString();
+      cmd.trim();
+      if (cmd == "roll" || cmd == "r") {
+        rollDice();
+      }
+    }
+    
+    if (isRolling) {
+      // Show rolling animation
+      drawRollingAnimation();
+      
+      // Check if roll animation is complete
+      if (millis() - rollStartTime >= ROLL_DURATION) {
+        isRolling = false;
+        currentState = STATE_SHOW_RESULT;
+        
+        // Draw final dice value in center
+        drawDiceValue(currentDiceValue);
+        
+        // Update instruction text (centered below dice value)
+        tft.fillRect(0, 140, 240, 30, TFT_BLACK);
+        tft.setTextColor(TFT_CYAN, TFT_BLACK);
+        tft.setTextSize(2);
+        tft.setTextDatum(MC_DATUM); // Middle center alignment
+        if (accelerometerAvailable) {
+          tft.drawString("Shake to Roll!", 120, 160, 1); // Centered below dice value
+        } else {
+          tft.drawString("Type 'roll'", 120, 160, 1);
+        }
       }
     }
   }
