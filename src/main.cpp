@@ -73,9 +73,179 @@ const uint8_t dicePatterns[6][9] = {
   {1, 0, 1, 1, 0, 1, 1, 0, 1}  // 6
 };
 
+// Muted wireframe color (readable behind bright text)
+static const uint16_t DICE_WIREFRAME_COLOR = 0x2965; // dark gray-blue
+
+// Isometric-style 2D projection (same idea as D10: explicit screen coords, then drawLine)
+static void isoTo2D(float x, float y, float z, int cx, int cy, float sc, int* ox, int* oy) {
+  *ox = cx + (int)((x - z) * sc);
+  *oy = cy + (int)((x + z) * sc * 0.55f - y * sc);
+}
+
+// Wireframe: 3D unit-scale vertices, edges = shortest nonzero inter-vertex distance (platonic solids)
+static void drawWireframeIso(const float* vx, const float* vy, const float* vz, int nVert,
+                             int cx, int cy, int r, uint16_t color) {
+  if (nVert < 2 || nVert > 16) return;
+  const float sc = (float)r * 0.45f;
+  int px[16], py[16];
+  for (int i = 0; i < nVert; i++) {
+    isoTo2D(vx[i], vy[i], vz[i], cx, cy, sc, &px[i], &py[i]);
+  }
+  float minD = 1e9f;
+  for (int i = 0; i < nVert; i++) {
+    for (int j = i + 1; j < nVert; j++) {
+      float dx = vx[i] - vx[j];
+      float dy = vy[i] - vy[j];
+      float dz = vz[i] - vz[j];
+      float d = sqrtf(dx * dx + dy * dy + dz * dz);
+      if (d > 1e-5f && d < minD) minD = d;
+    }
+  }
+  if (minD >= 1e8f) return;
+  const float tol = minD * 0.12f;
+  for (int i = 0; i < nVert; i++) {
+    for (int j = i + 1; j < nVert; j++) {
+      float dx = vx[i] - vx[j];
+      float dy = vy[i] - vy[j];
+      float dz = vz[i] - vz[j];
+      float d = sqrtf(dx * dx + dy * dy + dz * dz);
+      if (fabsf(d - minD) <= tol) {
+        tft.drawLine(px[i], py[i], px[j], py[j], color);
+      }
+    }
+  }
+}
+
+// D4: same visual language as D10 — 2D trig, no 3D pipeline
+static void drawD4Wireframe2D(int cx, int cy, int r, uint16_t color) {
+  const int n = 3;
+  const float ang0 = -M_PI / 2.0f;
+  int tx, ty, bx[3], by[3];
+  for (int k = 0; k < n; k++) {
+    float a = ang0 + k * (2.0f * (float)M_PI / n);
+    bx[k] = cx + (int)(cosf(a) * r);
+    by[k] = cy + (int)(sinf(a) * r * 0.92f) + (int)(r * 0.12f);
+  }
+  tx = cx;
+  ty = cy - (int)(r * 0.95f);
+  for (int k = 0; k < n; k++) {
+    int nk = (k + 1) % n;
+    tft.drawLine(bx[k], by[k], bx[nk], by[nk], color);
+    tft.drawLine(tx, ty, bx[k], by[k], color);
+  }
+}
+
+// D20: outer hex + inner rotated hex + radials (same nested-polygon pattern as D10)
+static void drawD20Wireframe2D(int cx, int cy, int r, uint16_t color) {
+  const int n = 6;
+  const float ang0 = -M_PI / 2.0f;
+  int ox[n], oy[n], ix[n], iy[n];
+  int ir = r * 58 / 100;
+  for (int k = 0; k < n; k++) {
+    float a = ang0 + k * (2.0f * (float)M_PI / n);
+    ox[k] = cx + (int)(cosf(a) * r);
+    oy[k] = cy + (int)(sinf(a) * r);
+    float a2 = ang0 + (k + 0.5f) * (2.0f * (float)M_PI / n);
+    ix[k] = cx + (int)(cosf(a2) * ir);
+    iy[k] = cy + (int)(sinf(a2) * ir);
+  }
+  for (int k = 0; k < n; k++) {
+    int nk = (k + 1) % n;
+    tft.drawLine(ox[k], oy[k], ox[nk], oy[nk], color);
+    tft.drawLine(ix[k], iy[k], ix[nk], iy[nk], color);
+    tft.drawLine(ox[k], oy[k], ix[k], iy[k], color);
+    tft.drawLine(ox[nk], oy[nk], ix[k], iy[k], color);
+  }
+}
+
+// Stylized D10 (pentagonal trapezohedron hint): nested pentagons + zigzag
+static void drawD10Wireframe2D(int cx, int cy, int r, uint16_t color) {
+  const int n = 5;
+  float ang0 = -M_PI / 2.0f;
+  int ox[n], oy[n], ix[n], iy[n];
+  int ir = r * 55 / 100;
+  for (int k = 0; k < n; k++) {
+    float a = ang0 + k * (2.0f * (float)M_PI / n);
+    ox[k] = cx + (int)(cosf(a) * r);
+    oy[k] = cy + (int)(sinf(a) * r);
+    float a2 = ang0 + (k + 0.5f) * (2.0f * (float)M_PI / n);
+    ix[k] = cx + (int)(cosf(a2) * ir);
+    iy[k] = cy + (int)(sinf(a2) * ir);
+  }
+  for (int k = 0; k < n; k++) {
+    int nk = (k + 1) % n;
+    tft.drawLine(ox[k], oy[k], ox[nk], oy[nk], color);
+    tft.drawLine(ix[k], iy[k], ix[nk], iy[nk], color);
+    tft.drawLine(ox[k], oy[k], ix[k], iy[k], color);
+    tft.drawLine(ox[nk], oy[nk], ix[k], iy[k], color);
+  }
+}
+
+// Percentile dice: two D10-style gems side by side
+static void drawD100Wireframe2D(int cx, int cy, int r, uint16_t color) {
+  int gap = r * 8 / 10;
+  drawD10Wireframe2D(cx - gap, cy, r, color);
+  drawD10Wireframe2D(cx + gap, cy, r, color);
+}
+
+// Background wireframe for the currently highlighted dice type (selection screen)
+static void drawDiceTypeWireframeBackground(int faces) {
+  const int cx = 120;
+  const int cy = 102;
+  const int r = 60; // match D10 outer radius for consistent size
+
+  switch (faces) {
+    case 4:
+      drawD4Wireframe2D(cx, cy, r, DICE_WIREFRAME_COLOR);
+      break;
+    case 6: {
+      const float c[8][3] = {
+        {-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1},
+        {-1, -1, 1}, {1, -1, 1}, {1, 1, 1}, {-1, 1, 1}
+      };
+      float vx[8], vy[8], vz[8];
+      for (int i = 0; i < 8; i++) {
+        vx[i] = c[i][0] * 0.48f;
+        vy[i] = c[i][1] * 0.48f;
+        vz[i] = c[i][2] * 0.48f;
+      }
+      drawWireframeIso(vx, vy, vz, 8, cx, cy, r * 2, DICE_WIREFRAME_COLOR);
+      break;
+    }
+    case 8: {
+      const float o[6][3] = {
+        {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}
+      };
+      float vx[6], vy[6], vz[6];
+      for (int i = 0; i < 6; i++) {
+        vx[i] = o[i][0] * 0.65f;
+        vy[i] = o[i][1] * 0.65f;
+        vz[i] = o[i][2] * 0.65f;
+      }
+      drawWireframeIso(vx, vy, vz, 6, cx, cy, r * 3, DICE_WIREFRAME_COLOR);
+      break;
+    }
+    case 10:
+      drawD10Wireframe2D(cx, cy, r, DICE_WIREFRAME_COLOR);
+      break;
+    case 20:
+      drawD20Wireframe2D(cx, cy, r, DICE_WIREFRAME_COLOR);
+      break;
+    case 100:
+      // Two D10-style gems (doubled from r*36/100)
+      drawD100Wireframe2D(cx, cy, r * 72 / 100, DICE_WIREFRAME_COLOR);
+      break;
+    default:
+      break;
+  }
+}
+
 void drawDiceValue(int value) {
   // Clear the center area for text (adjusted to avoid overlap with "Shake to Roll!")
   tft.fillRect(0, 60, 240, 60, TFT_BLACK);
+
+  // Same die wireframe as on the selection screen, behind the digits
+  drawDiceTypeWireframeBackground(currentDiceFaces);
   
   // Draw large dice value text in the center (slightly higher)
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -93,6 +263,9 @@ void drawDiceValue(int value) {
 void drawDiceSelectionScreen() {
   // Clear screen
   tft.fillScreen(TFT_BLACK);
+
+  // Wireframe of the currently selected dice type (behind labels)
+  drawDiceTypeWireframeBackground(currentDiceFaces);
   
   // Draw title
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
@@ -185,6 +358,7 @@ void rollDice() {
   
   // Clear screen and show rolling
   tft.fillScreen(TFT_BLACK);
+  drawDiceTypeWireframeBackground(currentDiceFaces);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
   tft.setTextSize(2);
   tft.setTextDatum(TC_DATUM);
@@ -296,20 +470,17 @@ void checkShake() {
       Serial.print("Selected dice: D");
       Serial.println(currentDiceFaces);
       
-      // Clear screen and show result screen
+      // Clear screen and show result screen (value + wireframe first, then chrome on top)
       tft.fillScreen(TFT_BLACK);
+      drawDiceValue(1);
       tft.setTextColor(TFT_GREEN, TFT_BLACK);
       tft.setTextSize(2);
       tft.setTextDatum(TC_DATUM);
       char confirmStr[20];
       sprintf(confirmStr, "D%d Selected", currentDiceFaces);
       tft.drawString(confirmStr, 120, 50, 1);
-      
       tft.setTextColor(TFT_CYAN, TFT_BLACK);
-      tft.drawString("Shake to Roll!", 120, 160, 1); // Centered below dice value
-      
-      // Draw initial value
-      drawDiceValue(1);
+      tft.drawString("Shake to Roll!", 120, 160, 1);
       
       delay(1000); // Show confirmation briefly
     } else {
@@ -501,6 +672,7 @@ void checkTouch() {
           Serial.println(currentDiceFaces);
           
           tft.fillScreen(TFT_BLACK);
+          drawDiceValue(1);
           tft.setTextColor(TFT_GREEN, TFT_BLACK);
           tft.setTextSize(2);
           tft.setTextDatum(TC_DATUM);
@@ -508,8 +680,7 @@ void checkTouch() {
           sprintf(confirmStr, "D%d Selected", currentDiceFaces);
           tft.drawString(confirmStr, 120, 50, 1);
           tft.setTextColor(TFT_CYAN, TFT_BLACK);
-          tft.drawString("Shake to Roll!", 120, 120, 1);
-          drawDiceValue(1);
+          tft.drawString("Shake to Roll!", 120, 160, 1);
         }
       }
     }
@@ -571,6 +742,7 @@ void loop() {
         // Confirm selection
         currentState = STATE_SHOW_RESULT;
         tft.fillScreen(TFT_BLACK);
+        drawDiceValue(1);
         tft.setTextColor(TFT_GREEN, TFT_BLACK);
         tft.setTextSize(2);
         tft.setTextDatum(TC_DATUM);
@@ -578,8 +750,7 @@ void loop() {
         sprintf(confirmStr, "D%d Selected", currentDiceFaces);
         tft.drawString(confirmStr, 120, 50, 1);
         tft.setTextColor(TFT_CYAN, TFT_BLACK);
-        tft.drawString("Shake to Roll!", 120, 160, 1); // Centered below dice value
-        drawDiceValue(1);
+        tft.drawString("Shake to Roll!", 120, 160, 1);
       }
     }
   } else {
@@ -613,8 +784,8 @@ void loop() {
         // Draw final dice value in center
         drawDiceValue(currentDiceValue);
         
-        // Update instruction text (centered below dice value)
-        tft.fillRect(0, 140, 240, 30, TFT_BLACK);
+        // Clear instruction band below wireframe (past D10 bottom ~cy+r = 162)
+        tft.fillRect(0, 165, 240, 50, TFT_BLACK);
         tft.setTextColor(TFT_CYAN, TFT_BLACK);
         tft.setTextSize(2);
         tft.setTextDatum(MC_DATUM); // Middle center alignment
